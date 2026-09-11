@@ -4,12 +4,6 @@
 ================================================================================
  UnAuthHunter —— 多目标端口扫描 + 未授权访问漏洞检测器 (v1.0)
 ================================================================================
-用途:
-    1. 对多个 IP / CIDR 网段进行 TCP 端口扫描;
-    2. 自动识别开放端口上的服务协议 (HTTP/HTTPS/Banner);
-    3. 使用多重特征严格匹配, 检测各类服务/中间件/框架/AI 组件的
-       【未授权访问 / 匿名访问 / 默认口令】漏洞;
-    4. 输出控制台结果 + JSON / CSV / HTML 报告。
 
 依赖: 仅 Python 3.8+ 标准库, 无第三方依赖。
 ================================================================================
@@ -274,12 +268,18 @@ class Target:
 
     # ---- banner ----
     def get_banner(self) -> bytes:
+        """抓取服务端主动下发的 banner。
+        注意: 已识别为 HTTP 的端口无需抓 banner(HTTP 不会主动下发);
+        其余端口用较短超时, 避免对无 banner 服务白等。"""
         if self.banner_done:
             return self.banner
         self.banner_done = True
+        if self.proto is not None:      # HTTP(S) 服务无 banner 语义
+            self.banner = b""
+            return self.banner
         try:
-            s = tcp_connect(self.ip, self.port, self.timeout)
-            s.settimeout(min(2.0, self.timeout))
+            s = tcp_connect(self.ip, self.port, min(1.0, self.timeout))
+            s.settimeout(min(1.0, self.timeout))
             self.banner = s.recv(2048)
             s.close()
         except Exception:
@@ -288,20 +288,24 @@ class Target:
 
     # ---- HTTP 识别: 先 http 后 https ----
     def identify(self):
+        """识别 HTTP/HTTPS 协议。结果缓存; 识别失败(非 HTTP 服务)亦缓存,
+        避免每个 POC 重复发起 http+https 两次连接超时等待。"""
         if self.identify_done:
             return self.proto
         self.identify_done = True
-        r = http_request(self.ip, self.port, "/", timeout=self.timeout)
+        # 识别用较短超时: 服务端若不响应 HTTP, 等满 timeout 毫无收益
+        it = min(2.0, self.timeout)
+        r = http_request(self.ip, self.port, "/", timeout=it)
         if r is not None:
             self.proto = "http"
             self.server_header = r.header("server")
             return self.proto
-        r = http_request(self.ip, self.port, "/", timeout=self.timeout, https=True)
+        self.proto = None
+        r = http_request(self.ip, self.port, "/", timeout=it, https=True)
         if r is not None:
             self.proto = "https"
             self.server_header = r.header("server")
-            return self.proto
-        return None
+        return self.proto
 
     # ---- HTTP 请求(用识别出的协议) ----
     def http(self, path, **kw) -> Optional[Resp]:
@@ -674,14 +678,30 @@ def poc_pgsql(t: Target) -> Optional[Finding]:
      fix="dubbo.protocol.qos.enable=false 或 qos.accept.foreign.ip=false; "
          "网络 ACL 收口; 升级到带鉴权的 QoS 版本。")
 def poc_dubbo(t: Target) -> Optional[Finding]:
+    # Dubbo QoS 未授权特征(严格): 匿名连接后服务端主动下发 dubbo> 提示符,
+    # 或响应体含 Dubbo QoS 专属标识。仅靠 "a.b.c" 点分文本判定会把 SSH/SMTP/
+    # 自定义协议等服务全部误报, 故必须先确认对端确实是 Dubbo QoS。
+    low_hint = (t.get_banner() or b"").lower()
+    # 1) 服务端 banner 直接暴露 Dubbo 标识
+    if b"dubbo" in low_hint and (b"qos" in low_hint or b"telnet" in low_hint):
+        return Finding(t, _find_poc("dubbo-telnet"), "Confirmed",
+                       "Dubbo QoS banner: " + b2s(low_hint, 120))
     resp = t.send(b"ls\r\n", read_timeout=3.0)
     if not resp:
         return None
-    if re.search(rb"[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+){2,}", resp) and \
-            b"command not found" not in resp.lower():
-        return Finding(t, _find_poc("dubbo-telnet"), "Confirmed",
-                       "telnet ls 无认证返回服务列表: " + b2s(resp, 120))
-    return None
+    low = resp.lower()
+    # 2) 响应必须含 Dubbo QoS 专属提示/标识
+    dubbo_markers = (b"dubbo>", b"dubbo telnet", b"ascii telnet commands",
+                     b"dubbo qos", b"please input", b"exit to quit")
+    if not any(m in low for m in dubbo_markers):
+        return None
+    if b"command not found" in low or b"no such command" in low:
+        return None
+    # 3) 至少包含一个 Dubbo 服务方法签名特征(接口名.方法名)
+    if not re.search(rb"[\w$]+(\.[\w$]+){2,}", resp):
+        return None
+    return Finding(t, _find_poc("dubbo-telnet"), "Confirmed",
+                   "Dubbo QoS 匿名可执行 ls: " + b2s(resp, 140))
 
 
 # ---------------------------- RMI / JRMP ---------------------------------------
@@ -1276,20 +1296,30 @@ def poc_weblogic(t: Target) -> Optional[Finding]:
 
 @poc("tomcat-manager", "Tomcat Manager 未授权/暴露", "中间件", "High",
      [8080, 8081, 8181, 8443, 9009],
-     desc="manager/html 匿名可访问可部署 WAR RCE; 返回 401 说明存在管理端(需弱口令配合)。",
+     desc="manager/html 匿名可访问可部署 WAR RCE(200); 仅返回 401 只说明路径存在, 不代表未授权。",
      fix="删除 manager 应用或 conf/tomcat-users.xml 配置强口令; 收口内网。")
 def poc_tomcat_manager(t: Target) -> Optional[Finding]:
     r = t.http("/manager/html")
     if r is None:
         return None
-    if r.status == 200 and r.has("tomcat") and r.has("server status"):
-        return Finding(t, _find_poc("tomcat-manager"), "Confirmed",
-                       "manager/html 匿名可访问", url=t.http_url("/manager/html"))
-    if r.status == 401:
-        return Finding(t, _find_poc("tomcat-manager"), "Likely",
-                       "manager/html 存在(401 需认证), 建议核查默认/弱口令",
-                       url=t.http_url("/manager/html"))
-    return None
+    if r.status != 200:
+        # 401/403 只说明该路径存在且受保护 —— 属"暴露面提示", 不构成未授权漏洞,
+        # 且任何启用 Basic 认证的站点都会返回 401, 故不再上报(原 Likely 噪声源)。
+        return None
+    body = (r.body or b"").decode("latin-1", "replace").lower()
+    # 强指纹: 必须命中 Tomcat Manager 管理页专属元素(界面文案/表单动作/部署提示),
+    # 仅含 "tomcat"/"server status" 字样的反代页或错误页不判, 避免误报。
+    strong_markers = ("tomcat web application manager", "/manager/html/list",
+                      "manager-gui", "/manager/html/deploy", "deploy directory or war file",
+                      "org.apache.catalina", "message=ok", "undeploy")
+    if not any(m in body for m in strong_markers):
+        return None
+    # 需同时具备 manager 语义(路径/表单动作/标题), 进一步收敛
+    if "manager" not in body:
+        return None
+    return Finding(t, _find_poc("tomcat-manager"), "Confirmed",
+                   "manager/html 匿名可访问(未授权, 可部署 WAR)",
+                   url=t.http_url("/manager/html"))
 
 
 @poc("eureka-unauth", "Spring Eureka 注册中心未授权", "中间件", "Medium",
@@ -2111,8 +2141,12 @@ class Scanner:
         t0 = time.time()
         done = [0]
 
+        # 连接超时: 端口存活探测不需要等服务端应用层, 取 min(1.0s, timeout) 即可。
+        # 被防火墙静默丢弃(DROP)的端口是扫描耗时的主要来源, 该值直接决定总时长。
+        ct = min(1.0, self.timeout)
+
         def task(ip, port):
-            if scan_port(ip, port, timeout=min(2.0, self.timeout)):
+            if scan_port(ip, port, timeout=ct):
                 with self.lock:
                     self.open_targets.append(Target(ip, port, self.timeout))
                     self.stats["open"] += 1
@@ -2135,8 +2169,11 @@ class Scanner:
         self.log(c("\n[*] 服务识别与未授权检测: %d 个开放端口, %d 个 POC"
                    % (len(self.open_targets), len(POCS)), C))
         t0 = time.time()
+        # POC 阶段是大量阻塞式网络等待, 并发度不应低于端口扫描阶段太多;
+        # 原上限 64 会把 POC 阶段串行化。取 workers 的 1/2, 上限 256。
+        poc_workers = max(32, min(self.workers // 2, 256))
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(self.workers, 64)) as ex:
+                max_workers=poc_workers) as ex:
             list(ex.map(self._check_target, self.open_targets))
         self.log(c("[*] 检测完成: %d 项发现, 耗时 %.1fs"
                    % (len(self.findings), time.time() - t0), C))
