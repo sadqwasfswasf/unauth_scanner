@@ -4,6 +4,24 @@
 ================================================================================
  UnAuthHunter —— 多目标端口扫描 + 未授权访问漏洞检测器 (v1.0)
 ================================================================================
+用途:
+    1. 对多个 IP / CIDR 网段进行 TCP 端口扫描;
+    2. 自动识别开放端口上的服务协议 (HTTP/HTTPS/Banner);
+    3. 使用多重特征严格匹配, 检测各类服务/中间件/框架/AI 组件的
+       【未授权访问 / 匿名访问 / 默认口令】漏洞;
+    4. 输出控制台结果 + JSON / CSV / HTML 报告。
+
+设计原则(保证精准度):
+    - 每个 POC 均要求 "状态码 + 协议特征 + 内容指纹" 多重命中才判定,
+      尽可能区分 "服务存在" 与 "确实未授权";
+    - 置信度分级: Confirmed(已验证可未授权访问) / Likely(强特征疑似);
+    - 只做只读检测(GET/握手), 不做写入型利用, 不做口令爆破
+      (默认口令仅做单组/两组凭据的一次性验证)。
+
+免责声明:
+    本工具仅限用于自有资产安全检查、已授权的渗透测试与合规评估
+    (如等保 2.0 资产排查)。未经授权对他人系统扫描属于违法行为,
+    使用者需自行承担法律责任。
 
 依赖: 仅 Python 3.8+ 标准库, 无第三方依赖。
 ================================================================================
@@ -1207,22 +1225,114 @@ def poc_rabbitmq(t: Target) -> Optional[Finding]:
     return None
 
 
-@poc("rocketmq-dashboard", "RocketMQ Dashboard/Console 未授权", "中间件", "High",
-     [8080, 8180, 9876],
-     desc="rocketmq-console 无认证, 可查看与更新消息/主题/消费者配置。",
-     fix="console 增加 ACL 与登录; 端口收口内网。")
-def poc_rocketmq(t: Target) -> Optional[Finding]:
-    r = t.http("/topic/query.topic.list?pageNo=1&pageSize=10")
+# ---------------------------- RocketMQ Dashboard -------------------------------
+# rocketmq-console/dashboard 统一响应信封: {"status":0,"data":{...},"errMsg":null}
+# 开启 rocketmq.config.loginRequired 后, 受保护接口(/topic/**、/cluster/** 等)对
+# 未登录请求会被 AuthInterceptor 重定向到登录页或返回 401/鉴权错误。
+# 因此"未授权"必须同时满足:
+#   ① 目标确为 RocketMQ Console(命中其 Result 信封 status/data/errMsg 特征)
+#   ② 受保护接口未发生任何鉴权拦截(无 3xx 跳登录、无 401/403、无鉴权错误消息)
+#   ③ 成功状态码且返回数据体
+# 注意: 旧逻辑"仅 / 页面含 rocketmq 字样即判未授权"会把公开的登录页/SPA 外壳
+# 误报为未授权; 旧逻辑"JSON 存在 data 键即判可读"会把 {"data":null,"errMsg":
+# "need login"} 误判 —— 二者均已移除。
+_ROCKETMQ_AUTH_HINTS = (
+    "need login", "not login", "no login", "please login", "login first",
+    "unauthenticated", "unauthorized", "authentication", "forbidden",
+    "permission denied", "no permission", "access denied",
+    "请先登录", "未登录", "无权限", "没有权限", "鉴权",
+)
+_ROCKETMQ_APIS = (
+    "/topic/query.topic.list?pageNo=1&pageSize=10",
+    "/cluster/list.query",
+)
+
+
+def _rocketmq_auth_blocked(r: Resp) -> bool:
+    """响应是否表明已被鉴权拦截(即 Dashboard 已启用登录)。"""
     if r is None:
-        r = t.http("/topic/query.topic.list?topicKey=&pageNo=1&pageSize=10")
-    if r is not None and r.status == 200 and r.json() and \
-            isinstance(r.json(), dict) and "data" in r.json():
-        return Finding(t, _find_poc("rocketmq-dashboard"), "Confirmed",
-                       "topic 列表接口匿名可读", url=t.http_url("/"))
-    r2 = t.http("/")
-    if r2 is not None and r2.status == 200 and r2.has("rocketmq"):
-        return Finding(t, _find_poc("rocketmq-dashboard"), "Likely",
-                       "页面含 RocketMQ Dashboard 特征", url=t.http_url("/"))
+        return True
+    if r.status in (301, 302, 303, 307, 308):
+        return True                      # 重定向(通常跳转 /login)
+    if r.status in (401, 403):
+        return True
+    body = (r.body or b"").decode("utf-8", "replace").lower()
+    if any(h in body for h in _ROCKETMQ_AUTH_HINTS):
+        return True
+    j = r.json()
+    if isinstance(j, dict):
+        for k in ("status", "code"):
+            if k in j:
+                try:
+                    if int(j[k]) in (401, 403):
+                        return True
+                except Exception:
+                    pass
+        for k in ("errMsg", "message", "msg", "error"):
+            v = j.get(k)
+            if isinstance(v, str) and any(h in v.lower()
+                                          for h in _ROCKETMQ_AUTH_HINTS):
+                return True
+    return False
+
+
+def _rocketmq_envelope(j):
+    """解析 RocketMQ Console 的 Result 信封 -> (is_console, success, data)。"""
+    if not isinstance(j, dict) or "data" not in j:
+        return False, False, None
+    if "errMsg" not in j and "status" not in j:
+        return False, False, None        # 非 Console 信封
+    sc = None
+    for k in ("status", "code"):
+        if k in j:
+            try:
+                sc = int(j[k])
+            except Exception:
+                sc = None
+            break
+    ok = sc is None or sc in (0, 200)
+    return True, ok, j.get("data")
+
+
+def _rocketmq_has_records(data) -> bool:
+    if isinstance(data, list):
+        return len(data) > 0
+    if isinstance(data, dict):
+        if isinstance(data.get("total"), int) and data["total"] > 0:
+            return True
+        for v in data.values():
+            if isinstance(v, list) and len(v) > 0:
+                return True
+            if isinstance(v, dict):
+                for vv in v.values():
+                    if isinstance(vv, list) and len(vv) > 0:
+                        return True
+                    if isinstance(vv, dict) and vv:
+                        return True
+    return False
+
+
+@poc("rocketmq-dashboard", "RocketMQ Dashboard/Console 未授权", "中间件", "High",
+     [8080, 8081, 8082, 8180],
+     desc="rocketmq-console 未启用登录, 受保护接口(/topic/**、/cluster/**)匿名可读, "
+          "可查看与变更消息/主题/消费者配置。已启用鉴权(需登录)的实例不再误报。",
+     fix="application.properties 设 rocketmq.config.loginRequired=true 并配置 "
+         "user.properties 强口令; 收口内网访问。")
+def poc_rocketmq(t: Target) -> Optional[Finding]:
+    for path in _ROCKETMQ_APIS:
+        r = t.http(path)
+        if r is None:
+            continue
+        if _rocketmq_auth_blocked(r):
+            continue                     # 已被鉴权拦截 -> 已启用登录, 安全
+        is_console, ok, data = _rocketmq_envelope(r.json())
+        if not (is_console and ok):
+            continue
+        conf = "Confirmed" if isinstance(data, (dict, list)) else "Likely"
+        detail = "含真实数据" if _rocketmq_has_records(data) else "返回空数据集"
+        return Finding(t, _find_poc("rocketmq-dashboard"), conf,
+                       "受保护接口 %s 未鉴权可访问(%s)" % (path, detail),
+                       url=t.http_url(path))
     return None
 
 
