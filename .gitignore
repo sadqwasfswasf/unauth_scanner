@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# 扫描结果：默认输出目录，可能包含真实 IP / 主机名 / 命名空间 / 配置片段，
+# 严禁提交到公开仓库。
+# ---------------------------------------------------------------------------
+reports/
+unauth_report_*
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 与本项目无关的脚本（BISHENG 检测器及其测试，另行发布）
+bisheng_poc_all.py
+tests/test_bisheng_poc_mock.py
